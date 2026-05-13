@@ -1,0 +1,73 @@
+1.普通MLA
+- hidden_states -> q_lora / latent_cache
+- q_lora -> q_b_proj -> q_nope, q_pe
+- latent_cache -> k_nope, k_pe
+- q_nope @ w_kc -> q_nope_out
+- attn(q_nope_out, k_nope, rope) 输出 latent value
+- latent_value @ w_vc -> o_proj
+
+2.DSA
+真正做 attention 前先调用 m.indexer(...) 为每个 query token 生成 topk_indices
+后在 attention 核里把这个 topk_indices 传进去, 让 kernel 只看这些候选位置而不是整段 KV
+
+1.prepare
+- 先把 MLA 需要的 q_nope_out / q_pe / k_nope / k_pe / q_lora 准备好
+- 再调用 indexer 算 topk_indices
+ 给indexer输入
+- hidden_states 给 indexer 生成 head-gate 权重
+- q_lora 给 indexer 生成用于检索的 query
+- positions 让 indexer 自己那套 q/k 也应用同样的 RoPE
+
+3.Indexer
+内部有三组关键投影
+- wq_b 把 q_lora 投成 indexer 自己的 query
+- wk 把 hidden_states 投成 indexer 自己的 key hidden_states -> wk -> k_norm
+- weights_proj 从 hidden_states 预测每个 head 的 gate/权重
+
+Indexer 在 NPU 上怎么跑
+
+1. 生成 indexer 的 q
+
+- q_lora -> wq_b -> [bs, n_heads, head_dim]
+- 然后拆成 q_pe + q_nope
+- q_pe 再走 RoPE
+- 最后拼回 q
+- 对应代码在 nsa_indexer.py 
+
+2. 生成 indexer 的 k
+
+- hidden_states -> wk -> k_norm
+- 再拆 k_pe + k_nope
+- k_pe 应用同样的位置旋转
+- 最后得到 indexer 用的 k
+- 对应代码在 nsa_indexer.py 
+
+3. 生成每个 head 的 gate 权重
+
+- weights = self.weights_proj(x.float())[0].to(torch.bfloat16) 
+- 这个得到的 weights 可理解成 不同检索 head 对当前 token 应该如何加权 用于把多个检索 head 的打分整合起来
+- 你可以把它类比成一个 learned head gate 而不是标准 attention 里的内容向量
+
+4.把 indexer 的 key 写入独立的 index-K cache
+
+- forward_batch.token_to_kv_pool.set_index_k_buffer(layer_id, out_cache_loc, k)
+- 注意这里写入的不是 MLA 的主 KV cache 而是 indexer 自己使用的检索 key cache。
+- 这就是 DSA 能做到“先检索 后真正注意力”的基础
+- 先把用于检索的 key 存起来 之后每步都能快速做 top-k 搜索
+
+5.. 调用 Ascend 的 lightning indexer 算 topk
+输入关键信息有：
+- query=q.view(-1, self.n_heads, self.head_dim)
+- key=past_key_states
+- weights=weights
+- actual_seq_lengths_query
+- actual_seq_lengths_key
+- block_table
+- sparse_count=self.index_topk
+- sparse_mode=3
+
+DSA core阶段
+Ascend backend 中 只要 topk_indices is not None  就直接走 forward_sparse()
+
+
+
