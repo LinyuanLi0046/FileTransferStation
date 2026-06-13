@@ -43,7 +43,6 @@ import psutil
 DEFAULT_BACKUP_PATH = "/tmp/sglang_scheduler_thread_affinity_backup.json"
 DEFAULT_SCHEDULER_KEYWORDS = (
     "sglang::scheduler",
-    "scheduler",
 )
 DEFAULT_ROOT_KEYWORDS = (
     "sglang.launch_server",
@@ -226,8 +225,11 @@ def detect_scheduler_pids(
     if explicit_pids:
         return sorted(set(explicit_pids))
 
+    protected_pids = get_ancestor_pids(os.getpid())
     matched = []
     for proc in psutil.process_iter(["pid", "name"]):
+        if proc.pid in protected_pids:
+            continue
         haystack = f"{get_name(proc)} {get_cmdline(proc)}"
         if any(keyword in haystack for keyword in keywords):
             matched.append(proc.pid)
