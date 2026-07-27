@@ -133,9 +133,9 @@ from sglang.srt.utils import (
     add_prefix,
     get_bool_env_var,
     is_gfx95_supported,
-    is_npu_before_atlas_a5,
     log_info_on_rank0,
     make_layers,
+    is_npu_before_atlas_a5,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -463,8 +463,6 @@ class MQALayer(nn.Module):
                 self.wo_a, "weight_scale_inv"
             ), "FP8 quant_config must create weight_scale_inv"
         if self.use_npu_a5_mxfp8_wo_a:
-            # Fp8LinearMethod applies the A5 batched-GEMM layout after its
-            # generic block-FP8 post-processing.
             self.wo_a._dsv4_a5_mxfp8_wo_a = True
             self.wo_a._dsv4_num_groups = self.n_local_groups
             self.wo_a._dsv4_o_lora_rank = self.o_lora_rank
@@ -857,6 +855,7 @@ class MQALayer(nn.Module):
             q = q.view(-1, self.n_local_heads, self.head_dim)
             _dummy = q.new_ones(q.shape[-1])
             q = torch_npu.npu_rms_norm(q, _dummy, self.eps)[0]
+            # print(f"=== [MQALayer]  forward prepare {q.shape} {q.sum()=}", flush=True)
 
             if qkv_a is not None:
                 kv = qkv_a[..., self.q_lora_rank :]
@@ -1015,6 +1014,7 @@ class MQALayer(nn.Module):
                 q_out,
                 x_quant=x_quant,
             )
+            print(f"=== [MQALayer] after _forward_prepare {q.sum()=}{q.shape=}", flush=True)
 
         # The cache write is always fused / already done by _forward_prepare* --
         # tell the backend to skip its own store_cache. When `kv is None`
@@ -1119,6 +1119,9 @@ class MQALayer(nn.Module):
             )
             o = output
         else:
+            print(f"wo_a.weight={self.wo_a.weight.dtype} {tuple(self.wo_a.weight.shape)} "
+                f"scale={getattr(self.wo_a,'weight_scale',None) is not None} "
+                f"scale_inv={getattr(self.wo_a,'weight_scale_inv',None) is not None}", flush=True)
             wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
 
@@ -1127,6 +1130,12 @@ class MQALayer(nn.Module):
             o = attn_tp_all_reduce(o)
 
         return o
+
+def _p8(t: torch.Tensor):
+    """不管张量是什么 shape，永远展平后只取前8个元素，用于精简调试打印"""
+    if t is None:
+        return None
+    return t.reshape(-1)[:8].detach().to(torch.float32).cpu().tolist()
 
 
 class DeepseekV4DecoderLayer(nn.Module):
@@ -1297,8 +1306,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                             num_tokens,
                             time.perf_counter() - tic,
                         )
-
-    def prewarm_mhc_token_count_buckets(
+          def prewarm_mhc_token_count_buckets(
         self, max_num_tokens: int, device: torch.device
     ) -> Tuple[int, ...]:
         from sglang.srt.layers.mhc import get_mhc_pre_token_count_representatives
@@ -1445,12 +1453,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         if _is_npu:
-            return torch.ops.custom.npu_hc_post(
-                x.unsqueeze(0),
-                residual.unsqueeze(0),
-                post.unsqueeze(0),
-                comb.unsqueeze(0),
+            import vllm_ascend.vllm_ascend_C
+            return torch.ops._C_ascend.npu_hc_post(
+                x.unsqueeze(0), residual.unsqueeze(0), post.unsqueeze(0), comb.unsqueeze(0)
             ).squeeze(0)
+
+            #     y = torch.ops._C_ascend.npu_hc_post(
+            #     x.unsqueeze(dim=0), residual.unsqueeze(dim=0), post.unsqueeze(dim=0), comb.unsqueeze(dim=0)
+            # )
+            # return y.squeeze(dim=0
+            
+            # return torch.ops.custom.npu_hc_post(x, residual, post, comb)
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
             from sglang.srt.layers.mhc import mhc_post
@@ -1494,7 +1507,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         Optional[torch.Tensor],
     ]:
         use_fused = self.use_fused_mhc_post_pre
-
+        # torch.save(hidden_states, f"/home/z00894098/output_decoderlayer/hidden_states_init_{self.layer_id}.pt")
+        print(f"=== [DeepseekV4DecoderLayer] init hidden_states {hidden_states.sum()=},{_p8(hidden_states)=}", flush=True)
         if prev_residual is not None and use_fused:
             residual, post, comb, hidden_states = mhc_fused_post_pre(
                 hidden_states,
@@ -1519,6 +1533,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             x_quant = None
         else:
             residual = hidden_states
+            print(f"=== [DeepseekV4DecoderLayer] before hc_pre (residual) {hidden_states.sum()=},{_p8(hidden_states)=}", flush=True)
             hidden_states, post, comb, norm_fused = self.hc_pre(
                 hidden_states,
                 self.hc_attn_fn,
@@ -1527,6 +1542,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm=self.input_layernorm,
                 forward_batch=forward_batch,
             )
+            print(f"=== [DeepseekV4DecoderLayer] after hc_pre {hidden_states.sum()=},{_p8(hidden_states)=}", flush=True)
+            print(f"=== [DeepseekV4DecoderLayer] after hc_pre {post.sum()=}", flush=True)
+            print(f"=== [DeepseekV4DecoderLayer] after hc_pre {comb.sum()=}", flush=True)
+
+        # torch.save(hidden_states, f"/home/z00894098/output_decoderlayer/hidden_states_after_hc_pre_{self.layer_id}.pt")
             if not norm_fused:
                 if _use_aiter and _is_gfx95_supported:
                     x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
@@ -1535,17 +1555,21 @@ class DeepseekV4DecoderLayer(nn.Module):
                         self.rms_norm_eps,
                     )
                 else:
+                    print(f"=== [DeepseekV4DecoderLayer] before input_layernorm {hidden_states.sum()=},{_p8(hidden_states)=}", flush=True)
                     hidden_states = self.input_layernorm(hidden_states)
                     x_quant = None
             else:
                 x_quant = None
-
+        # torch.save(hidden_states, f"/home/z00894098/output_decoderlayer/hidden_states_before_attn_{self.layer_id}.pt")
+        print(f"=== [DeepseekV4DecoderLayer]after layernorm {hidden_states.sum()=} {hidden_states.shape=},{_p8(hidden_states)=}", flush=True)
         hidden_states = self.self_attn(
             x=hidden_states,
             positions=positions,
             forward_batch=forward_batch,
             x_quant=x_quant,
         )
+        # 一致
+        print(f"=== [DeepseekV4DecoderLayer] after attention {hidden_states.sum()=} {hidden_states.shape=},{_p8(hidden_states)=}", flush=True)
 
         if use_fused:
             fused_mhc = try_fused_hc_post_pre(
@@ -1589,6 +1613,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_fused = True
         else:
             hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            # 差了0.5
+            print(f"=== [DeepseekV4DecoderLayer] after hc_post {_p8(hidden_states)=} {hidden_states.sum()=} {hidden_states.shape=}", flush=True)
             residual = hidden_states
             hidden_states, post, comb, norm_fused = self.hc_pre(
                 hidden_states,
@@ -1598,6 +1624,10 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm=self.post_attention_layernorm,
                 forward_batch=forward_batch,
             )
+            # 差了1
+            print(f"=== [DeepseekV4DecoderLayer] after hc_pre 002 {_p8(hidden_states)=} {hidden_states.sum()=} {hidden_states.shape=}", flush=True)
+            print(f"=== [DeepseekV4DecoderLayer] after hc_pre 002 {post.sum()=}", flush=True)
+            print(f"=== [DeepseekV4DecoderLayer] after hc_pre 002{comb.sum()=}", flush=True)
             if not norm_fused:
                 hidden_states = self.post_attention_layernorm(hidden_states)
 
@@ -1647,6 +1677,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = _a2a_scatter_chunks[r].contiguous()
             input_ids = input_ids.tensor_split(s)[r].contiguous()
             input_ids_global = input_ids_global.tensor_split(s)[r].contiguous()
+        
+        
+        # 差了1
+        print(f"=== [DeepseekV4DecoderLayer] after parallel gather and before mlp {_p8(hidden_states)=} {hidden_states.sum()=} {hidden_states.shape=}", flush=True)
+
         hidden_states = self.mlp(
             hidden_states,
             forward_batch,
@@ -1656,6 +1691,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             # reduce via reduce_scatterv at the combine below (else double-reduce).
             use_reduce_scatter=_use_cp or _use_gatherv_pair,
         )
+        print(f"=== [DeepseekV4DecoderLayer] after mlp {hidden_states.sum()=} {_p8(hidden_states)=} {hidden_states.shape=}", flush=True)
+        
         if _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
@@ -1683,10 +1720,14 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if not use_fused:
             hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            print(f"=== [DeepseekV4DecoderLayer] return hidden states {hidden_states.sum()=} {_p8(hidden_states)=}{hidden_states.shape=}", flush=True)
+            print(f"==========================finish one layer computing =================================", flush=True)    
+        
             return hidden_states, None, None, None
 
         # Return the deferred FFN hc_post state; the next layer consumes it with
         # cross-layer fusion, and the final layer is completed in DeepseekV4Model.
+        
         return hidden_states, residual, post, comb
 
 
@@ -1794,7 +1835,12 @@ class DeepseekV4Model(nn.Module):
     ) -> Union[torch.Tensor, PPProxyTensors]:
         if self.pp_group.is_first_rank:
             hidden_states = self.embed_tokens(input_ids)
+            # torch.save(hidden_states, f"/home/z00894098/output_model/hidden_states_of_embeding.pt")
+            print(f"=== [DeepseekV4Model] embeding {hidden_states.sum()=}", flush=True)
+            print(f"{self.hc_mult=}")
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+            print(f"=== [DeepseekV4Model] after unsqueeze {hidden_states.sum()=}", flush=True)
+            # torch.save(hidden_states, f"/home/z00894098/output_model/hidden_states_of_embeding_02.pt")
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
@@ -1803,6 +1849,8 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = hidden_states.view(
                     hidden_states.shape[0], self.hc_mult, self.hidden_size
                 )
+            print(f"=== [DeepseekV4Model]  view {hidden_states.sum()=}", flush=True)
+
 
         if get_attention_dp_size() > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
@@ -1823,6 +1871,8 @@ class DeepseekV4Model(nn.Module):
             positions = cp_split_and_rebuild_position(forward_batch, positions)
             input_ids = cp_round_robin_input_ids(input_ids)
             input_ids_global = input_ids
+            print(f"=== [DeepseekV4Model]  after pcp {hidden_states.sum()=}", flush=True)
+            # torch.save(hidden_states, f"/home/z00894098/output_model/hidden_states_of_embeding_04.pt")
 
         # Reset Compressor's per-step freqs_cis cache from any previous step.
         for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
@@ -1840,6 +1890,8 @@ class DeepseekV4Model(nn.Module):
                 if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
+            # torch.save(hidden_states, f"/home/z00894098/output_model/hidden_states_of_embeding_05.pt")
+            print(f"=== [DeepseekV4Model]  start {self.layers[i].layer_id} {hidden_states.sum()=}", flush=True)
             with ctx:
                 hidden_states, prev_residual, prev_post, prev_comb = layer(
                     positions=positions,
@@ -1851,11 +1903,12 @@ class DeepseekV4Model(nn.Module):
                     prev_post=prev_post,
                     prev_comb=prev_comb,
                 )
+            print(f"=== [DeepseekV4Model]  after {self.layers[i].layer_id} {hidden_states.sum()=}", flush=True)
         if use_fused and last_layer is not None:
             hidden_states = last_layer.hc_post(
                 hidden_states, prev_residual, prev_post, prev_comb
             )
-
+        
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         if self.pp_group.is_last_rank and dsa_use_prefill_cp(forward_batch):
             hidden_states = cp_all_gather_rerange_output(
@@ -2296,6 +2349,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                             if name not in params_dict:
                                 continue
                             param = params_dict[name]
+                            weight_loader = param.weight_loader
+
                             # FP4 expert scales ship as E8M0 (float8_e8m0fnu),
                             # but the param is uint8 and the GMM kernel consumes
                             # the raw exponent byte. weight_loader's copy_ would
@@ -2308,6 +2363,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                             ):
                                 loaded_weight = loaded_weight.view(torch.uint8)
                             weight_loader = param.weight_loader
+
                             maybe_executor_submit(
                                 executor=executor,
                                 futures=futures,
@@ -2530,3 +2586,5 @@ def _dequant_fp8_wo_a(
         yield name, _dequant_fp8(weight, scale)
 
     yield from weights_dict.items()
+
+   
